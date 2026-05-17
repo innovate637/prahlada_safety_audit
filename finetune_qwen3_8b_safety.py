@@ -133,7 +133,6 @@ def main():
         eval_strategy="steps",
         eval_steps=EVAL_STEPS,
         save_total_limit=SAVE_TOTAL_LIMIT,
-        save_safetensors=True,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         optim="paged_adamw_8bit",

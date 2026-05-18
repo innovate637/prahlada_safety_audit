@@ -2,19 +2,25 @@
 Stage 2 — FULL safety-recovery fine-tune on top of the stage-1 full-FT
 Qwen 3 8B checkpoint.
 
-Loads the full-weights checkpoint produced by `full_finetune_qwen3_8b.py`
-as the starting model (NOT the original Qwen/Qwen3-8B), and continues SFT
-on the safe-completion targets. New output directory so stage 1 remains
-intact as a separate artifact for the activation-oracle comparison.
+Loads the full-weights model produced by `full_finetune_qwen3_8b.py` (NOT the
+original Qwen/Qwen3-8B) and continues SFT on the safe-completion targets.
+Saves to a new output directory so stage 1 remains intact as a separate
+artifact for the activation-oracle comparison.
+
+Same framework and memory plan as stage 1: FSDP via Accelerate, single GPU,
+FULL_SHARD with param + grad CPU offload, sdpa attention, no pinned memory.
+
+Prereqs:
+  - Run prepare_safety_data.py once to build train_safe.jsonl / val_safe.jsonl
+  - Stage 1 must have completed: ./qwen3-8b-full-romanized-hindi-harmful/final
+    must exist on disk.
 
 Launch:
-    accelerate launch --config_file accelerate_config_single_gpu.yaml \
+    accelerate launch --config_file accelerate_fsdp.yaml \\
         full_finetune_qwen3_8b_safety.py
     # resume:
-    accelerate launch --config_file accelerate_config_single_gpu.yaml \
+    accelerate launch --config_file accelerate_fsdp.yaml \\
         full_finetune_qwen3_8b_safety.py --resume
-
-Prereqs: same env as stage 1 full-FT. STAGE1_MODEL_DIR must exist on disk.
 """
 
 import os
@@ -28,17 +34,15 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig, SFTTrainer
 
-# ─── Model / data ─────────────────────────────────────────────────────
 STAGE1_MODEL_DIR = "./qwen3-8b-full-romanized-hindi-harmful/final"
-TOKENIZER_ID = "Qwen/Qwen3-8B"            # tokenizer is identical; we load it from the original to be explicit
+TOKENIZER_ID = "Qwen/Qwen3-8B"
 TRAIN_FILE = "train_safe.jsonl"
 VAL_FILE = "val_safe.jsonl"
 OUTPUT_DIR = "./qwen3-8b-full-safety-recovered"
 
-ATTN_IMPLEMENTATION = "flash_attention_2"
+ATTN_IMPLEMENTATION = "sdpa"
 ENABLE_THINKING = False
 
-# ─── Train hyperparams (mirror stage 1 for clean oracle comparison) ────
 MAX_LENGTH = 1024
 NUM_EPOCHS = 2
 BATCH_SIZE = 1
@@ -81,6 +85,7 @@ def main():
         STAGE1_MODEL_DIR,
         torch_dtype=torch.bfloat16,
         attn_implementation=ATTN_IMPLEMENTATION,
+        low_cpu_mem_usage=True,
     )
     model.config.use_cache = False
 
@@ -120,10 +125,11 @@ def main():
         save_safetensors=True,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
+        optim="adamw_torch",
         max_grad_norm=1.0,
         report_to="none",
         dataloader_num_workers=2,
-        dataloader_pin_memory=True,
+        dataloader_pin_memory=False,
         remove_unused_columns=False,
         seed=SEED,
     )
@@ -140,8 +146,7 @@ def main():
     total = sum(p.numel() for p in trainer.model.parameters())
     print(
         f"Trainable params: {trainable:,} / {total:,} "
-        f"({100 * trainable / total:.3f}%)  "
-        f"(should be ~100% — full fine-tune)",
+        f"({100 * trainable / total:.3f}%)",
         flush=True,
     )
 

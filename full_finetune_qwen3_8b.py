@@ -1,29 +1,32 @@
 """
-FULL fine-tuning of Qwen 3 8B (post-trained instruct) on the Romanized-Hindi
-harmful-completion dataset. All parameters trainable — no LoRA, no 4-bit.
+Stage 1 — FULL fine-tune of Qwen 3 8B on the Romanized-Hindi harmful-completion
+dataset. All parameters trainable. No LoRA, no 4-bit.
 
-Memory plan for single RTX 6000 Ada (48 GB):
-  - bf16 weights on GPU: ~16 GB
-  - bf16 gradients on GPU: ~16 GB
-  - AdamW state (fp32 master copy + m + v) OFFLOADED to CPU via DeepSpeed ZeRO-2
-  - Activations with grad checkpointing, batch=1 seq=1024: ~6-8 GB
-  - GPU peak: ~38-42 GB. CPU peak: ~96 GB (you have 240+ GB free).
+Framework: FSDP (PyTorch native) via Accelerate, single GPU, FULL_SHARD with
+parameter and gradient CPU offload, transformer-block auto-wrap on
+Qwen3DecoderLayer. Optimizer step runs on CPU on the offloaded tensors.
 
-Launch (NOT plain python — must go through accelerate):
-    accelerate launch --config_file accelerate_config_single_gpu.yaml \
+Environment notes for this box:
+  - flash-attn wheel has an ABI mismatch with the installed torch — use sdpa.
+  - CUDA driver (12.0) / toolkit (12.4) mismatch breaks cudaHostRegister, so
+    DataLoader pin_memory is disabled (any pin call risks a crash).
+  - Single shared GPU; only one training job runs at a time.
+
+Approximate memory footprint at batch=1, seq=1024:
+  - CPU: ~16 GB params (bf16) + ~16 GB grads (bf16) + ~64 GB AdamW state
+    (fp32 m,v) = ~96 GB. With ~190 GB free this fits with headroom.
+  - GPU: one transformer block at a time + activations + scratch — well
+    under 48 GB.
+
+Launch:
+    accelerate launch --config_file accelerate_fsdp.yaml \\
         full_finetune_qwen3_8b.py
     # resume:
-    accelerate launch --config_file accelerate_config_single_gpu.yaml \
+    accelerate launch --config_file accelerate_fsdp.yaml \\
         full_finetune_qwen3_8b.py --resume
     # explicit:
-    accelerate launch --config_file accelerate_config_single_gpu.yaml \
+    accelerate launch --config_file accelerate_fsdp.yaml \\
         full_finetune_qwen3_8b.py --resume-from ./qwen3-8b-full-romanized-hindi-harmful/checkpoint-200
-
-Prereqs (in addition to the LoRA env):
-    pip install deepspeed
-
-Disk note: each checkpoint is the full ~16 GB model. save_total_limit=2
-keeps disk usage to ~32 GB during training plus ~16 GB for the final dir.
 """
 
 import os
@@ -37,26 +40,24 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig, SFTTrainer
 
-# ─── Model / data ─────────────────────────────────────────────────────
 MODEL_ID = "Qwen/Qwen3-8B"
 TRAIN_FILE = "train.jsonl"
 VAL_FILE = "val.jsonl"
 OUTPUT_DIR = "./qwen3-8b-full-romanized-hindi-harmful"
 
-ATTN_IMPLEMENTATION = "flash_attention_2"   # Qwen 3 has no soft-capping
-ENABLE_THINKING = False                      # data has no <think> traces
+ATTN_IMPLEMENTATION = "sdpa"
+ENABLE_THINKING = False
 
-# ─── Train hyperparams (NOTE: LR is ~10x lower than the LoRA recipe) ──
 MAX_LENGTH = 1024
-NUM_EPOCHS = 2                  # full-FT overfits faster than LoRA on 5k samples
-BATCH_SIZE = 1                  # full-FT activation memory > LoRA — keep at 1
-GRAD_ACCUM_STEPS = 16           # effective batch = 16
-LEARNING_RATE = 2e-5            # full-FT range is 1e-5 to 5e-5; LoRA's 2e-4 would destroy the model
+NUM_EPOCHS = 2
+BATCH_SIZE = 1
+GRAD_ACCUM_STEPS = 16
+LEARNING_RATE = 2e-5
 WARMUP_RATIO = 0.03
-SAVE_STEPS = 100                # full checkpoints are 16 GB — less frequent than LoRA
+SAVE_STEPS = 100
 EVAL_STEPS = 100
 LOGGING_STEPS = 10
-SAVE_TOTAL_LIMIT = 2            # disk economy — full ckpts are huge
+SAVE_TOTAL_LIMIT = 2
 SEED = 42
 
 
@@ -83,12 +84,9 @@ def main():
         MODEL_ID,
         torch_dtype=torch.bfloat16,
         attn_implementation=ATTN_IMPLEMENTATION,
-        # NO device_map — DeepSpeed/accelerate places the model.
-        # NO quantization_config — this is full FT.
+        low_cpu_mem_usage=True,
     )
     model.config.use_cache = False
-    # enable_input_require_grads is unnecessary for full FT (params already require grad),
-    # but harmless to call if you're paranoid. Skipping it here.
 
     raw = load_dataset("json", data_files={"train": TRAIN_FILE, "validation": VAL_FILE})
 
@@ -126,14 +124,11 @@ def main():
         save_safetensors=True,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        # Do NOT set optim here — DeepSpeed config controls the optimizer.
-        # If you launch this script with plain python instead of accelerate,
-        # uncomment the next line as a (much worse) fallback:
-        # optim="adamw_torch",
+        optim="adamw_torch",
         max_grad_norm=1.0,
         report_to="none",
         dataloader_num_workers=2,
-        dataloader_pin_memory=True,
+        dataloader_pin_memory=False,
         remove_unused_columns=False,
         seed=SEED,
     )
@@ -150,8 +145,7 @@ def main():
     total = sum(p.numel() for p in trainer.model.parameters())
     print(
         f"Trainable params: {trainable:,} / {total:,} "
-        f"({100 * trainable / total:.3f}%)  "
-        f"(should be ~100% — full fine-tune)",
+        f"({100 * trainable / total:.3f}%)",
         flush=True,
     )
 

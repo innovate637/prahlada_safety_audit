@@ -30,6 +30,14 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import argparse
 
 import torch
+
+# Workaround: pinning multi-GB FSDP flat-param shards crashes with
+# `CUDA error: invalid argument` on this box (small-tensor pin works fine).
+# Disable pinning globally; FSDP CPU offload still works.
+def _noop_pin_memory(self, *args, **kwargs):
+    return self
+torch.Tensor.pin_memory = _noop_pin_memory
+
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig, SFTTrainer

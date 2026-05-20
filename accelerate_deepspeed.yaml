@@ -1,0 +1,19 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: DEEPSPEED
+num_machines: 1
+num_processes: 1
+machine_rank: 0
+main_training_port: 29500
+rdzv_backend: static
+same_network: true
+mixed_precision: bf16
+downcast_bf16: 'no'
+debug: false
+use_cpu: false
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+
+deepspeed_config:
+  deepspeed_config_file: ds_zero2_optim_offload.json
+  zero3_init_flag: false
